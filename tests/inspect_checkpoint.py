@@ -131,8 +131,16 @@ def main():
         return 1
 
     model, processor, schema, maps = _load()
+    # Also build maps for the qwen2_vl schema so we can detect which schema the model
+    # actually emits. Training data is Qwen2-VL-encoded; if the data_collator doesn't
+    # translate (it currently doesn't), the model emits qwen2_vl-style action tokens even
+    # though --backbone=qwen3_5. Inspector reports whichever schema parses the output.
+    qwen2_vl_schema = action_tokens.get_schema("qwen2_vl")
+    qwen2_vl_maps = action_tokens.build_id_maps(qwen2_vl_schema, processor.tokenizer)
     table = pq.read_table(VALID_SHARD)
     print(f"valid shard rows: {table.num_rows}")
+    print(f"qwen2_vl tokens:  act_beg={qwen2_vl_maps.act_beg_id} act_end={qwen2_vl_maps.act_end_id}, "
+          f"{len(qwen2_vl_maps.action_to_token)} group IDs")
 
     max_new_tokens = ACTION_CHUNK_LEN * PER_ACTION_TOKEN_BUDGET  # 64
 
@@ -160,14 +168,19 @@ def main():
         gen_ids = out[0, prompt_len:].tolist()
         decoded = processor.tokenizer.decode(gen_ids, skip_special_tokens=False)
         print(f"generated text:\n  {decoded}")
-        stats = _classify_output(gen_ids, maps, processor)
-        print(f"stats: {stats}")
+        # Try both schemas — model may emit either depending on what the data was encoded in.
+        stats_q35 = _classify_output(gen_ids, maps, processor)
+        stats_q2 = _classify_output(gen_ids, qwen2_vl_maps, processor)
+        best = stats_q35 if stats_q35["chunks_closed"] > stats_q2["chunks_closed"] else stats_q2
+        emitting = "qwen3_5" if best is stats_q35 else "qwen2_vl"
+        print(f"stats (qwen3_5):  {stats_q35}")
+        print(f"stats (qwen2_vl): {stats_q2}")
         verdict = (
-            "PARSEABLE" if stats["chunks_closed"] >= 1 and stats["non_action_or_whitespace_tokens"] == 0
-            else "PARTIAL"  if stats["chunks_closed"] >= 1
+            "PARSEABLE" if best["chunks_closed"] >= 1 and best["non_action_or_whitespace_tokens"] == 0
+            else "PARTIAL"  if best["chunks_closed"] >= 1
             else "MALFORMED"
         )
-        print(f"verdict: {verdict}")
+        print(f"verdict: {verdict}  (model emits {emitting} schema)")
 
     return 0
 
