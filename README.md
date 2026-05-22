@@ -355,6 +355,23 @@ Notes on bugs found post-Phase-1-foundation-refactor, mostly from the 2026-05-22
 
 **Fix.** Added `DifferentialLRTrainer` (subclass of `transformers.Trainer`) that puts `embed_tokens` and `lm_head` matrices in their own optimizer param group with `EMBED_LR` (default `30 × args.learning_rate`). This is coarser than per-row LR (the pretrained rows in the same matrix also get the higher LR), but it's enough to unblock the new rows and acceptable on the short SFT timeline.
 
+### Important: training data uses Qwen2-VL action tokens, not Qwen3.5
+
+**Symptom.** After the image+LR fixes brought smoke loss to 0.66 (vs the broken 5.78), the inspector still classified the output as MALFORMED — zero `<|act_start|>` tokens in the generation. But the raw generated text showed perfect 4-chunk action structure.
+
+**Cause.** The chunked preprocessor (`scripts/preprocess_chunked_actions.py`) emits action segments in the **Qwen2-VL schema** (`<|reserved_special_token_178|>` … `<|reserved_special_token_179|>` and reserved-slot group tokens). The data_collator passes those strings through `apply_chat_template` and tokenizes them as-is — there is no translation step from Qwen2-VL → Qwen3.5 schema before tokenization. So even though training runs with `--backbone=qwen3_5` (which adds `<|act_start|>` etc. to the vocab), the labels the model sees are still Qwen2-VL reserved-token IDs. The model correctly learns to predict those IDs at inference. The inspector's `_classify_output` checks against the Qwen3.5 schema action-token IDs and finds none, hence MALFORMED.
+
+**Verified empirically.** Running both schemas through the same generated output:
+- `qwen3_5` schema: 0 chunks_opened, 0 chunks_closed, 0/24 tokens in grammar
+- `qwen2_vl` schema: 4 chunks_opened, 4 chunks_closed, 20/24 tokens in grammar (the remaining 4 are newlines + `<|im_end|>`)
+
+**Status.** Inspector now reports both schemas and tells you which one parses (commit `819b835`). **Production inference will hit the same mismatch** — `agent_wrapper.py` builds its action tokenizer with the model's `--backbone` (qwen3_5), but the model emits qwen2_vl tokens. Two ways to fix it permanently:
+
+1. **Re-preprocess data with the qwen3_5 schema** — modify `preprocess_chunked_actions.py` to render action segments using `QWEN3_5_SCHEMA.act_start / .group_tokens` instead of the qwen2_vl reserved-slot strings. Requires retraining (~hours).
+2. **Add a token-ID translation step to the data_collator** — after tokenization, swap qwen2_vl reserved-slot IDs for the corresponding qwen3_5-added IDs. Lighter-weight; can be a regression test rather than a re-render.
+
+Pick after the headline-eval gate is established, since the current data + model are internally consistent — they just need `agent_wrapper` to be configured with `backbone=qwen2_vl` (or to support both at parse time) to function in production.
+
 ### Investigated and ruled out: chat template thinking-mode mismatch
 
 **Suspicion.** Hypothesized that training (no `enable_thinking` kwarg) and inference (handoff says pass `enable_thinking=False`) might render structurally different templates, causing the inference malformed output.
