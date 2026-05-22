@@ -78,7 +78,6 @@ torchrun --nproc-per-node="$nproc" --master-port="$training_port" \
     --adam_beta1 0.9 \
     --adam_beta2 0.95 \
     --warmup_ratio 0.03 \
-    --warmup_steps 100 \
     --lr_scheduler_type "cosine" \
     --per_device_train_batch_size $batch \
     --per_device_eval_batch_size $batch \
