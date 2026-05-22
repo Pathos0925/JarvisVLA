@@ -12,7 +12,8 @@ This repo is in the middle of a Phase-1 reimplementation that moves the executor
 
 ## Updates
 
-- **[2026.05.22]** Phase-1 SFT smoke run validated on 2× H200 144 GB. End-to-end pipeline (preprocessor → SFT → inspector) green, plus a multi-LLM code review surfaced one critical bug (image double-rescale in the data collator) and one important tuning issue (LR too low for newly-added action token embeddings) — both fixed; retrain in progress. New: H200-simplified SFT script (no DeepSpeed), async R2 checkpoint upload, checkpoint inspector, `DifferentialLRTrainer` for per-matrix learning rates.
+- **[2026.05.22 evening]** **Full Phase-1 SFT launched on 2× H200** (~32 hr at ~1 s/step on `DATASET_P=1.0`, `EMBED_LR=3e-5`, `LIGER=0`, `SAVE_STEPS=5000`). Pre-launch second-round review (Opus 4.7 / GPT-5.5 Pro / Gemini 3.1 Pro) caught and fixed: `--warmup_steps 100` overriding the ratio (dropped — warmup_ratio 0.03 now → 3480 warmup steps); EMBED_LR=30× over 116K steps risking catastrophic forgetting on pretrained vocab (lowered to 10×); R2 callback silently dropping failed uploads (now retries 4× with exponential backoff and surfaces failures); bash `${VAR:+...}` treating "0" as truthy (replaced with proper `_truthy` helper); `.env` not auto-loaded into training process (script now sources it). Also: `agent_wrapper.py` accepts `ACTION_SCHEMA` env to handle the Qwen2-VL action-token emission from a `--backbone=qwen3_5` checkpoint. Two prior smokes (`fix1`, `speedup1`) produced PARSEABLE checkpoints with final loss 0.66; speedup attempt (Liger+no-GC+workers=6) was net -2.3% so reverted; Liger machinery kept as opt-in. **R2 upload confirmed working** at training start.
+- **[2026.05.22 morning]** Phase-1 SFT smoke run validated on 2× H200 144 GB. End-to-end pipeline (preprocessor → SFT → inspector) green, plus a multi-LLM code review surfaced one critical bug (image double-rescale in the data collator) and one important tuning issue (LR too low for newly-added action token embeddings) — both fixed; retrain landed PARSEABLE checkpoint with clean Qwen2-VL action grammar (4/4 chunks per response). New: H200-simplified SFT script (no DeepSpeed), async R2 checkpoint upload, checkpoint inspector, `DifferentialLRTrainer` for per-matrix learning rates, vllm in a separate conda env.
 - **[2026.05.21]** Started reimplementation of the VLA backbone on **`Qwen/Qwen3.5-9B`** (multimodal). Planner for Phase 2 will be **`google/gemma-4-26B-A4B-it`**. See [REIMPLEMENTATION_PLAN.md](REIMPLEMENTATION_PLAN.md) for the full plan.
 - **[2025.03.21]** Paper available on [arXiv](https://arxiv.org/pdf/2503.16365).
 
@@ -36,9 +37,9 @@ The next generation of JARVIS-VLA targets:
 | Multi-GPU SFT dry-run (5 steps) | ✅ done; loss 10.51 → 9.76 on the 3× A100 rig, ~1 s/step on 2× H200 |
 | Production DeepSpeed SFT script (3× A100) | ✅ done (`scripts/train/vla_qwen3_5_9b_sft.sh`) |
 | H200 SFT script (no DeepSpeed, BATCH=4) | ✅ done (`scripts/train/vla_qwen3_5_9b_sft_h200.sh`) |
-| Phase-1 3000-step smoke + inspector | ✅ done; **uncovered an image preprocessing bug and an LR-for-new-tokens issue**; fix retrain in progress |
-| Async R2 checkpoint upload | ✅ done (`jarvisvla/train/r2_callback.py`) |
-| Full Phase-1 SFT run | ⏳ next — pending smoke-with-fixes verdict |
+| Phase-1 3000-step smoke + inspector | ✅ done; image preprocessing bug + LR-for-new-tokens fixed; fix1 + speedup1 smokes both PARSEABLE (loss 0.66, 4/4 chunks emitted) |
+| Async R2 checkpoint upload | ✅ done with retry (`jarvisvla/train/r2_callback.py`); auto-loads from `.env` |
+| Full Phase-1 SFT run | ⏳ **running** — launched 2026-05-22 evening, ~32 hr ETA, 115,763 steps, R2 uploads confirmed |
 | vLLM serve + smoke rollout | ⏳ pending SFT (deferred install — see [Known gotchas](#known-gotchas)) |
 | Headline eval vs Qwen2-VL baseline | ⏳ pending SFT |
 | Async pipelining in `agent_wrapper` | ⏳ deferred |

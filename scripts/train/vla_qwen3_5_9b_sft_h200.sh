@@ -29,6 +29,16 @@ export HF_HOME="${HF_HOME:-/workspace/hf_cache}"
 export HF_DATASETS_CACHE="${HF_DATASETS_CACHE:-/workspace/hf_cache/datasets}"
 export PYTHONPATH="$(cd "$(dirname "$0")/../.." && pwd):${PYTHONPATH:-}"
 
+# Auto-load .env so R2 / OPENROUTER credentials propagate to the python process.
+# set -a exports every variable assigned while it's in effect, so children see them.
+_ENV_FILE="$(cd "$(dirname "$0")/../.." && pwd)/.env"
+if [ -f "$_ENV_FILE" ]; then
+    set -a
+    # shellcheck disable=SC1090
+    . "$_ENV_FILE"
+    set +a
+fi
+
 epoch="${EPOCH:-1}"
 batch="${BATCH:-4}"
 gradient_accumulation_steps="${GRAD_ACCUM:-1}"
