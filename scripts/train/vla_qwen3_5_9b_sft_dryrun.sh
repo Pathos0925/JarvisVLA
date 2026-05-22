@@ -37,9 +37,9 @@ max_pixels=$((256 * 28 * 28))
 # confirmed Qwen3.5-9B works with sdpa.
 deepspeed --include "localhost:$cuda_visible_devices" --master_port="$training_port" \
     jarvisvla/train/train.py \
-    --deepspeed configs/deepspeed_config_s2.json \
+    --deepspeed configs/deepspeed_config_s2_offload.json \
     --backbone qwen3_5 \
-    --attn_implementation sdpa \
+    --attn_implementation flash_attention_2 \
     --dataset_name "$dataset_name" \
     --dataset_p 0.01 \
     --dataloader_num_workers 2 \
