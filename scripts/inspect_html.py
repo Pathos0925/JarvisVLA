@@ -98,6 +98,14 @@ def main():
     p.add_argument("--output", default="/tmp/checkpoint_review.html")
     p.add_argument("--seed", type=int, default=7)
     p.add_argument("--max-new-tokens", type=int, default=64)
+    p.add_argument("--sample", action="store_true", help="use multinomial sampling instead of greedy")
+    p.add_argument("--temperature", type=float, default=0.7)
+    p.add_argument("--top-p", type=float, default=0.9)
+    p.add_argument("--require-camera", action="store_true",
+                   help="ensure at least one predicted chunk emits camera motion; "
+                        "if none in the initial draw, top up samples until one does")
+    p.add_argument("--max-extra-tries", type=int, default=40,
+                   help="cap on additional samples drawn when --require-camera is set")
     args = p.parse_args()
 
     print(f"loading {args.model_path}", flush=True)
@@ -120,8 +128,13 @@ def main():
     seen = {}
     samples = []
     random.seed(args.seed)
-    indices = random.sample(range(table.num_rows), min(500, table.num_rows))
-    for i in indices:
+    all_indices = random.sample(range(table.num_rows), min(2000, table.num_rows))
+    idx_iter = iter(all_indices)
+    while len(samples) < args.num_samples:
+        try:
+            i = next(idx_iter)
+        except StopIteration:
+            break
         row = table.slice(i, 1).to_pylist()[0]
         user_text = next(s["text"] for s in row["conversations"][0]["content"] if s["type"] == "text")
         key = user_text[:50]
@@ -129,11 +142,40 @@ def main():
             continue
         seen[key] = True
         samples.append(row)
-        if len(samples) >= args.num_samples:
-            break
+
+    def emits_camera_motion(actions: list[list[int]]) -> bool:
+        """A predicted chunk uses the camera if its cam_pitch or cam_yaw bin != 10."""
+        return any(a[10] != CAMERA_CENTER or a[11] != CAMERA_CENTER for a in actions)
+
+    if args.sample:
+        torch.manual_seed(args.seed)
 
     cards = []
-    for i, row in enumerate(samples):
+    cam_seen = False
+    extra_tries = 0
+    sample_iter_indices = list(range(len(samples)))  # initial set
+    i = 0
+    while True:
+        if i >= len(samples):
+            # Out of pre-picked samples. If we've satisfied the camera requirement (or
+            # we're not requiring it), stop. Else, draw one more distinct sample.
+            if (not args.require_camera) or cam_seen or extra_tries >= args.max_extra_tries:
+                break
+            extra_tries += 1
+            try:
+                while True:
+                    j = next(idx_iter)
+                    row = table.slice(j, 1).to_pylist()[0]
+                    user_text = next(s["text"] for s in row["conversations"][0]["content"] if s["type"] == "text")
+                    key = user_text[:50]
+                    if key in seen:
+                        continue
+                    seen[key] = True
+                    samples.append(row)
+                    break
+            except StopIteration:
+                break
+        row = samples[i]
         user_text = next(s["text"] for s in row["conversations"][0]["content"] if s["type"] == "text")
         img = Image.open(io.BytesIO(row["image_bytes"][0])).convert("RGB")
         # Ground truth — tokenize assistant content as text and feed to the action tokenizer.
@@ -145,7 +187,7 @@ def main():
         truth_ids = processor.tokenizer.encode(truth_text, add_special_tokens=False)
         truth_actions = qwen2_vl_tok.token_2_group_action(truth_ids)
 
-        # Predicted — model.generate with greedy decoding.
+        # Predicted — model.generate with sampling (if --sample) or greedy.
         messages = [{"role": "user", "content": [
             {"type": "image"}, {"type": "text", "text": user_text},
         ]}]
@@ -154,13 +196,17 @@ def main():
         )
         inputs = processor(text=[prompt_text], images=[img], return_tensors="pt")
         inputs = {k: v.to(model.device) for k, v in inputs.items()}
+        gen_kwargs = dict(max_new_tokens=args.max_new_tokens, pad_token_id=processor.tokenizer.pad_token_id)
+        if args.sample:
+            gen_kwargs.update(do_sample=True, temperature=args.temperature, top_p=args.top_p)
+        else:
+            gen_kwargs.update(do_sample=False)
         with torch.no_grad():
-            out = model.generate(
-                **inputs, max_new_tokens=args.max_new_tokens, do_sample=False,
-                pad_token_id=processor.tokenizer.pad_token_id,
-            )
+            out = model.generate(**inputs, **gen_kwargs)
         gen_ids = out[0, inputs["input_ids"].shape[1]:].tolist()
         pred_actions = qwen2_vl_tok.token_2_group_action(gen_ids)
+        if emits_camera_motion(pred_actions):
+            cam_seen = True
 
         # Compare: did predicted chunks match truth on a per-position basis?
         match_count = sum(
@@ -174,9 +220,10 @@ def main():
         truth_html = render_action_table(truth_actions)
         pred_html = render_action_table(pred_actions)
 
+        camera_tag = ' <span class="cam-badge">cam</span>' if emits_camera_motion(pred_actions) else ""
         cards.append(f"""
 <div class="card">
-  <h2>sample {i}</h2>
+  <h2>sample {i}{camera_tag}</h2>
   <div class="meta">
     <div><b>id:</b> {html_mod.escape(row['id'])}</div>
     <div><b>label:</b> {html_mod.escape(label)}</div>
@@ -197,7 +244,9 @@ def main():
   </div>
 </div>
 """)
-        print(f"  sample {i}: {user_text[:60]!r} → {match_str}", flush=True)
+        cam_str = " [CAM]" if emits_camera_motion(pred_actions) else ""
+        print(f"  sample {i}: {user_text[:60]!r} → {match_str}{cam_str}", flush=True)
+        i += 1
 
     css = """
 body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
@@ -221,6 +270,9 @@ h1 { border-bottom: 2px solid #555; padding-bottom: 0.3em; }
 .action-table th { background: #2e3440; font-weight: 600; color: #88c0d0; }
 .action-table td.active { background: #3b4252; color: #ebcb8b; font-weight: 600; }
 .action-table td.null { color: #555; }
+.cam-badge { display: inline-block; font-size: 0.65em; padding: 0.15em 0.5em;
+             background: #5e81ac; color: white; border-radius: 4px; vertical-align: middle;
+             margin-left: 0.5em; }
 .intro { color: #b0b0b0; font-size: 0.95em; line-height: 1.6; }
 """
     body = "\n".join(cards)
