@@ -174,6 +174,19 @@ if __name__ == "__main__":
         n_added = processor.tokenizer.add_special_tokens({"additional_special_tokens": extra_specials})
         model = Qwen2VLForConditionalGeneration.from_pretrained(model_config.model_name_or_path, **model_kwargs)
     elif backbone == "qwen3_5":
+        # Liger-Kernel fused-Triton patches (RMSNorm + SwiGLU + fused linear+CE).
+        # Default ON; disable with LIGER=0 if any kernel mismatches the backbone.
+        # Must be applied BEFORE the model is loaded so .from_pretrained picks up the
+        # patched module classes.
+        if os.environ.get("LIGER", "1") != "0":
+            try:
+                from liger_kernel.transformers.monkey_patch import apply_liger_kernel_to_qwen3_5
+                apply_liger_kernel_to_qwen3_5()
+                if training_args.local_rank in (0, -1):
+                    print("[liger] applied fused kernels to qwen3_5 (fused_linear_ce, rms_norm, swiglu)", flush=True)
+            except ImportError:
+                if training_args.local_rank in (0, -1):
+                    print("[liger] not installed; skipping (pip install liger-kernel)", flush=True)
         processor = AutoProcessor.from_pretrained(model_config.model_name_or_path)
         # Schema action tokens + the existing point/visual/think/grounding/etc. specials.
         schema = action_tokens.get_schema("qwen3_5")

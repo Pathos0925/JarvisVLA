@@ -6,8 +6,13 @@
 # DDP across both GPUs is ~2× throughput over single-process. Keep BATCH=4 unless this OOMs,
 # then drop to 2 + GRAD_ACCUM=2 to preserve effective batch size.
 #
-# Hyperparams are identical to the production DeepSpeed script (vla_qwen3_5_9b_sft.sh):
-# the only deltas are the launcher, paths, and the absence of --deepspeed.
+# Hyperparams are identical to the production DeepSpeed script (vla_qwen3_5_9b_sft.sh)
+# with three throughput tweaks safe on 144 GB H200:
+#   - no --gradient_checkpointing (trades activation memory for ~30% step speedup)
+#   - --dataloader_num_workers 6 (image decode is CPU-bound at 2)
+#   - Liger-Kernel applied automatically when backbone=qwen3_5 (fused linear+CE saves
+#     activation memory at 248K vocab; disable with LIGER=0)
+# If OOM hits at BATCH=4, drop BATCH=2 + GRAD_ACCUM=2.
 #
 # R2 (Cloudflare) checkpoint upload is opt-in via env vars; absent → disabled silently.
 #   R2_BUCKET            (required)
@@ -54,7 +59,7 @@ torchrun --nproc-per-node="$nproc" --master-port="$training_port" \
     --attn_implementation flash_attention_2 \
     --dataset_name "$dataset_name" \
     --dataset_p "$dataset_p" \
-    --dataloader_num_workers 2 \
+    --dataloader_num_workers 6 \
     --dataloader_pin_memory True \
     --seed 43 \
     --model_name_or_path "$base_model_path" \
@@ -81,7 +86,6 @@ torchrun --nproc-per-node="$nproc" --master-port="$training_port" \
     --logging_strategy "steps" \
     --logging_steps 10 \
     --num_train_epochs $epoch \
-    --gradient_checkpointing \
     --torch_dtype bfloat16 \
     --bf16 True \
     --remove_unused_columns False \
