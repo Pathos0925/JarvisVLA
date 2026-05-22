@@ -14,6 +14,7 @@ Run with: python -m tests.smoke_qwen3_5
 from __future__ import annotations
 
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -29,7 +30,7 @@ from jarvisvla.train.utils_train import (
     resize_aux_heads,
 )
 
-MODEL_PATH = "/ephemeral/models/Qwen3.5-9B"
+MODEL_PATH = os.environ.get("MODEL_PATH", "/ephemeral/models/Qwen3.5-9B")
 
 
 def _hr(title: str) -> None:

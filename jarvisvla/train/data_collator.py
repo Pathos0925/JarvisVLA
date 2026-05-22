@@ -730,27 +730,20 @@ class DataAugment(object):
             image = fetch_image(image,factor=self.image_factor,min_pixels=self.min_pixels,max_pixels=self.max_pixels,max_ratio=self.max_ratio,)
         return image
         
-    def image_process(self, image_path:Union[str,Path]) -> Tensor:
-        
-        try:  
-            # 打开并统一转换到RGB
+    def image_process(self, image_path:Union[str,Path]) -> Image.Image:
+        # Return a PIL.Image (not a float tensor) so the downstream HF processor handles
+        # rescale + normalize itself. Calling transforms.ToTensor() here used to scale to
+        # [0,1], then the processor's default do_rescale=True divided by 255 again, crushing
+        # pixel values to ~0 and feeding the model effectively-blank images.
+        try:
             image = self.image_open(image_path)
             self.raw_image_size = image.size
-            
-            # image数据增强
+
             image = self.image_augment(image)
             self.augment_image_size = image.size
-            
-            # 缩放到VLM适合的大小
+
             image = self.image_resize(image)
             self.resize_image_size = image.size
-            
-            #1. 从整数（通常范围是 0-255）转换为浮点数。
-            #2. 将像素值缩放到 [0, 1] 的范围。
-            #3. 维度重排序
-            transform = transforms.ToTensor() 
-            image = transform(image)
-            
         except Exception as e:
             self.my_console.log(f"{e}")
             self.my_console.log(f"[red]can't open {image_path} correctly")

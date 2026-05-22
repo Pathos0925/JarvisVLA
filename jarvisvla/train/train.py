@@ -58,6 +58,69 @@ from jarvisvla.train.utils_train import (
 )
 from jarvisvla import QWEN_SPECIAL_TOKENS
 from jarvisvla.train.data_collator import make_collator
+from jarvisvla.train.r2_callback import R2UploadCallback
+
+
+class DifferentialLRTrainer(Trainer):
+    """Trainer with a higher LR for token-embedding and lm_head matrices.
+
+    Phase-1 SFT adds 73 randomly-initialized action-token rows to embed_tokens + lm_head.
+    A global LR of ~3e-6 is too low to pull those random rows out of the noise floor in
+    a few thousand steps; the pretrained rows in the same matrices tolerate a higher LR
+    fine over short SFT, so we elevate the whole matrix.
+
+    Override via env var:
+        EMBED_LR  — LR for embed_tokens + lm_head (default 30× args.learning_rate)
+    """
+
+    def create_optimizer(self):
+        if self.optimizer is not None:
+            return self.optimizer
+        from torch.optim import AdamW
+
+        args = self.args
+        embed_lr = float(os.environ["EMBED_LR"]) if os.environ.get("EMBED_LR") else 30.0 * args.learning_rate
+
+        try:
+            decay_param_names = set(self.get_decay_parameter_names(self.model))
+        except AttributeError:
+            decay_param_names = {n for n, _ in self.model.named_parameters() if "bias" not in n.lower() and "norm" not in n.lower()}
+
+        decay_params, no_decay_params, embed_params, embed_param_names = [], [], [], []
+        for name, p in self.model.named_parameters():
+            if not p.requires_grad:
+                continue
+            if "embed_tokens" in name or name == "lm_head.weight" or name.endswith(".lm_head.weight"):
+                embed_params.append(p)
+                embed_param_names.append(name)
+            elif name in decay_param_names:
+                decay_params.append(p)
+            else:
+                no_decay_params.append(p)
+
+        groups = []
+        if decay_params:
+            groups.append({"params": decay_params, "lr": args.learning_rate, "weight_decay": args.weight_decay})
+        if no_decay_params:
+            groups.append({"params": no_decay_params, "lr": args.learning_rate, "weight_decay": 0.0})
+        if embed_params:
+            groups.append({"params": embed_params, "lr": embed_lr, "weight_decay": 0.0})
+
+        self.optimizer = AdamW(
+            groups,
+            betas=(args.adam_beta1, args.adam_beta2),
+            eps=getattr(args, "adam_epsilon", 1e-8),
+        )
+        if args.local_rank in (0, -1):
+            print(
+                f"[diff-lr] base_lr={args.learning_rate} embed_lr={embed_lr} "
+                f"groups: decay={len(decay_params)} no_decay={len(no_decay_params)} embed={len(embed_params)}",
+                flush=True,
+            )
+            for n in embed_param_names:
+                print(f"[diff-lr]   embed group: {n}", flush=True)
+        return self.optimizer
+
 
 tqdm.pandas()    
 
@@ -247,6 +310,14 @@ if __name__ == "__main__":
         
     # HF transformers 5.x renamed `tokenizer` → `processing_class`. Pick whichever the
     # installed version accepts so the script works against both.
+    # Callbacks: rich progress (opt-in via TRL_USE_RICH) and R2 upload (opt-in via env).
+    callbacks = []
+    if TRL_USE_RICH:
+        callbacks.append(RichProgressCallback)
+    r2_callback = R2UploadCallback.maybe_create(training_args.output_dir)
+    if r2_callback is not None:
+        callbacks.append(r2_callback)
+
     import inspect as _inspect
     _trainer_kwargs = dict(
         model=model,
@@ -256,7 +327,7 @@ if __name__ == "__main__":
         eval_dataset=eval_dataset,
         model_init=None,
         compute_metrics=None,
-        callbacks=[RichProgressCallback] if TRL_USE_RICH else None,
+        callbacks=callbacks or None,
         preprocess_logits_for_metrics=None,
     )
     _sig = _inspect.signature(Trainer.__init__).parameters
@@ -264,7 +335,7 @@ if __name__ == "__main__":
         _trainer_kwargs["processing_class"] = processor.tokenizer
     else:
         _trainer_kwargs["tokenizer"] = processor.tokenizer
-    trainer = Trainer(**_trainer_kwargs)
+    trainer = DifferentialLRTrainer(**_trainer_kwargs)
     if training_args.local_rank == 0 or training_args.local_rank == -1:
         print_trainable_parameters(trainer.model,trainer.optimizer,f"logs/model_structure.json")
 
@@ -280,4 +351,10 @@ if __name__ == "__main__":
         model.config.use_cache = True
         trainer.save_model(training_args.output_dir)
         processor.save_pretrained(training_args.output_dir)
+        # Upload the end-of-training save (model + processor at output_dir root, skipping
+        # checkpoint-N subdirs which were already uploaded via on_save). Then block until
+        # all in-flight uploads finish before process exit.
+        if r2_callback is not None and training_args.local_rank in (0, -1):
+            r2_callback.upload_path(training_args.output_dir, remote_subprefix="final")
+            r2_callback.wait_all()
 
