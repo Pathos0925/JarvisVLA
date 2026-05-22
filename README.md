@@ -39,7 +39,7 @@ The next generation of JARVIS-VLA targets:
 | H200 SFT script (no DeepSpeed, BATCH=4) | ✅ done (`scripts/train/vla_qwen3_5_9b_sft_h200.sh`) |
 | Phase-1 3000-step smoke + inspector | ✅ done; image preprocessing bug + LR-for-new-tokens fixed; fix1 + speedup1 smokes both PARSEABLE (loss 0.66, 4/4 chunks emitted) |
 | Async R2 checkpoint upload | ✅ done with retry (`jarvisvla/train/r2_callback.py`); auto-loads from `.env` |
-| Full Phase-1 SFT run | ⏳ **running** — launched 2026-05-22 evening (PID 74111, `/tmp/sft_full.log`). At checkpoint-20000 (17% in, 5h18m elapsed, ~25h26m to go, 1.05 it/s sustained). 3 mid-train checkpoints inspected → all `PARSEABLE` (4/4 chunks). 4 R2 uploads complete (5K/10K/15K/20K), each 50.92 GiB in ~9 min. Loss ≈ 0.48 holding steady around the cosine peak. |
+| Full Phase-1 SFT run | ⏳ **running** — launched 2026-05-22 evening (PID 74111, `/tmp/sft_full.log`). At step **38K / 115,763 (33% in)**, ~10h elapsed, ~21h to go, 1.04 it/s sustained. 3 mid-train checkpoints inspected → all `PARSEABLE` (4/4 chunks). 7 R2 uploads complete (5K/10K/15K/20K/25K/30K/35K), each 50.92 GiB in ~9 min, 0 failures. Loss ≈ 0.48 holding steady around the cosine peak. Vision-grounding ablation on checkpoint-30000 with sampling: **9/16 samples emit camera motion**; one TNT-crafting prompt matched ground truth on all 4 chunks (memorized recipe). |
 | vLLM serve + smoke rollout | ⏳ pending SFT (deferred install — see [Known gotchas](#known-gotchas)) |
 | Headline eval vs Qwen2-VL baseline | ⏳ pending SFT |
 | Async pipelining in `agent_wrapper` | ⏳ deferred |
@@ -212,7 +212,13 @@ RUN_TAG=full-e1 bash scripts/train/vla_qwen3_5_9b_sft_h200.sh
 | `MAX_STEPS` | unset | hard cap on optimizer steps |
 | `EPOCH` | 1 | `--num_train_epochs` |
 | `RUN_TAG` | timestamp | suffix on output dir + wandb name |
-| `EMBED_LR` | `30 × learning_rate` | LR for `embed_tokens` + `lm_head` matrices (see [DifferentialLRTrainer](#differential-learning-rate)) |
+| `EMBED_LR` | `30 × learning_rate` | LR for `embed_tokens` + `lm_head` matrices (see [DifferentialLRTrainer](#differential-learning-rate)). The full epoch uses `EMBED_LR=3e-5` (10×) to reduce catastrophic-forgetting risk on pretrained vocab. |
+| `LIGER` | `1` | Apply Liger-Kernel fused RMSNorm / SwiGLU / linear+CE to qwen3_5. Set `LIGER=0` for canonical fix-baseline stack continuity. |
+| `GRADIENT_CHECKPOINTING` | `1` | Activation checkpointing for memory. Set to empty/`0` for ~20–40% step speedup on memory-rich GPUs. |
+| `DATALOADER_NUM_WORKERS` | `2` | More helps if image decode is CPU-bound; reviewers suggested 4–8. |
+| `SAVE_STEPS` | `1000` | Periodic checkpoint interval. For full epoch use `5000` (23 saves over 116K steps; R2 cost ~1.2 TB). |
+| `SAVE_TOTAL_LIMIT` | `3` | Local-disk checkpoint rotation. R2 keeps all uploads. |
+| `SAVE_ONLY_MODEL` | `0` | If truthy, save only model weights (skip optimizer state). Cuts checkpoints from 51 GiB → 18 GiB but **disables resume**. Default off for safety on long runs. |
 | `TRAINING_PORT` | 24001 | torchrun / deepspeed master port |
 
 ### Differential learning rate
@@ -221,21 +227,35 @@ RUN_TAG=full-e1 bash scripts/train/vla_qwen3_5_9b_sft_h200.sh
 
 ### R2 (Cloudflare) checkpoint upload
 
-Opt-in via env vars; absent → callback returns `None` and training proceeds unchanged.
+Opt-in via env vars; absent → callback returns `None` and training proceeds unchanged. The H200 training script auto-sources `$REPO/.env` so credentials propagate to the python process — without that, the callback silently disabled on the first launch attempt (since `train.py` doesn't read `.env` itself).
 
 ```bash
-# Required
+# Required (put in .env or shell)
 export R2_BUCKET=your-bucket
 export R2_ACCOUNT_ID=your-cloudflare-account-id
-export R2_ACCESS_KEY_ID=your-key-id
+export R2_ACCESS_KEY_ID=your-key-id        # OR R2_ACCESS_KEY (short form — both work)
 export R2_SECRET_ACCESS_KEY=your-secret
 
 # Optional
-export R2_PREFIX=runs/jarvisvla   # default: basename of OUTPUT_DIR
-export R2_MAX_WORKERS=4           # default: 4 background upload workers
+export R2_PREFIX=runs/jarvisvla            # default: basename of OUTPUT_DIR
+export R2_MAX_WORKERS=4                    # default: 4 background upload workers
 ```
 
-Then launch training as usual. The callback uploads each `checkpoint-N/` as Trainer writes it (async, rank-0 only, ThreadPoolExecutor) plus the post-`save_model` end-of-training save under `<prefix>/final/`. Idempotent per-file via HEAD/ContentLength check, so resumed runs and re-launches don't re-upload. `wait_all()` blocks process exit until all in-flight uploads finish.
+Then launch training as usual. The callback uploads each `checkpoint-N/` as Trainer writes it (async, rank-0 only, `ThreadPoolExecutor`) plus the post-`save_model` end-of-training save under `<prefix>/final/`. **Per-file retries** with exponential backoff (4 attempts) cover transient network blips; if all retries fail, `wait_all()` re-raises so the failure isn't silently lost. Idempotent per-file via HEAD/ContentLength check, so resumed runs and re-launches don't re-upload.
+
+### Pulling a checkpoint to a remote machine for inference
+
+`scripts/inference/r2_fetch_and_serve.sh` is a self-contained bash script that downloads a checkpoint from R2 (skipping the 33 GiB of optimizer / scheduler / rng state — saves ~65 % bandwidth, keeps just what vLLM needs), fetches the two missing processor configs from HF Hub, and launches `vllm serve` with `qwen3_next_mtp` speculative decoding. See top-of-script comments for one-shot setup on a fresh box.
+
+```bash
+git clone https://github.com/Pathos0925/JarvisVLA.git && cd JarvisVLA
+python -m venv .venv && source .venv/bin/activate
+pip install 'vllm>=0.21' boto3 huggingface-hub
+# populate .env with R2_BUCKET / R2_ACCOUNT_ID / R2_ACCESS_KEY / R2_SECRET_ACCESS_KEY
+bash scripts/inference/r2_fetch_and_serve.sh checkpoint-30000   # or 'final' for the end-of-training save
+```
+
+vLLM 0.21 ships torch built for CUDA 12.8 — the target machine needs an NVIDIA driver supporting CUDA 12.8+. This is why the SFT box (driver 12.7) can't run it.
 
 ---
 
@@ -311,7 +331,7 @@ MODEL_PATH=/path/to/final/checkpoint bash scripts/inference/serve_vllm_qwen3_5.s
 ```
 
 For rollout via `jarvisvla.evaluate.evaluate`, **set `ACTION_SCHEMA=qwen2_vl`** (until the
-re-preprocessing or in-collator translation lands — see "Debugging history"):
+re-preprocessing or in-collator translation lands — see "Debugging history"). The env var was added to `agent_wrapper.py` and overrides which `OneActionTokenizer` schema is used independently of the model's `--backbone`:
 
 ```bash
 ACTION_SCHEMA=qwen2_vl python -m jarvisvla.evaluate.evaluate \
@@ -358,7 +378,10 @@ The 2026-05-22 review (Opus 4.7 + GPT-5.5 Pro + Gemini 3.1 Pro) caught two bugs 
 | `configs/deepspeed_config_s2_offload.json` *(NEW)* | ZeRO-2 + CPU optimizer offload (the only validated production config on A100). |
 | `tests/test_action_mapping.py` *(NEW)* | 7 round-trip tests (null, inventory, jump+camera, hotbar+attack, etc.). |
 | `tests/smoke_qwen3_5.py` *(NEW)* | End-to-end load + resize + forward+backward smoke test. |
-| `tests/inspect_checkpoint.py` *(NEW)* | Generate actions on real valid-split samples and classify output. |
+| `tests/inspect_checkpoint.py` *(NEW)* | Generate actions on real valid-split samples and classify output (autodetects qwen2_vl vs qwen3_5 schema). |
+| `scripts/inspect_html.py` *(NEW)* | Self-contained HTML visual report: model predictions vs ground truth, embedded images, humanized action tables. Supports `--sample` + `--require-camera` flags. |
+| `scripts/translate_action_schema.py` *(NEW)* | Offline string-substitution converter from one action schema to another on chunked parquet shards. Used to produce `jarvisvla-chunk4-q35` (Qwen3.5-encoded) from the original Qwen2-VL-encoded dataset. |
+| `scripts/inference/r2_fetch_and_serve.sh` *(NEW)* | Remote-machine bootstrap: pull a checkpoint from R2 (skipping resume-only files), grab missing processor configs from HF Hub, launch vLLM. |
 
 ---
 
