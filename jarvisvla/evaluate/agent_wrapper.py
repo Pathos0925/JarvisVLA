@@ -9,6 +9,7 @@ from pathlib import Path
 from collections import Counter
 import numpy as np
 
+from jarvisvla import QWEN_SPECIAL_TOKENS
 from jarvisvla.inference import action_mapping, load_model, processor_wrapper
 from jarvisvla.utils.file_utils import load_json_file
 
@@ -31,14 +32,47 @@ INSTRUCTION_TEMPLATE = [
 ]
 
 class VLLM_AGENT:
+    # Per-action token budget: <|act_start|> + up to 9 button tokens + (0 or 1) inventory
+    # + 2 camera bins + <|act_end|>. Typical 6-10, max ~14. 16 gives slack without bloating
+    # the worst-case decode budget that hurts p99 latency.
+    _PER_ACTION_TOKEN_BUDGET = 16
+
     def __init__(self,checkpoint_path, base_url, api_key="EMPTY",
                  history_num=0,action_chunk_len=1, bpe=0,
                  instruction_type:Literal['simple','recipe','normal'] = 'normal',
-                 temperature=0.5):
+                 temperature=0.1):
         
         self.LLM_backbone,self.VLM_backbone = load_model.load_visual_model(checkpoint_path=checkpoint_path)
-        self.action_tokenizer = action_mapping.OneActionTokenizer(tokenizer_type=self.LLM_backbone)
-        
+
+        # Load tokenizer first so we can resolve action-token IDs against it.
+        self.tokenizer = None
+        from transformers import AutoTokenizer
+        if self.LLM_backbone in {"llama-3","llama-2","qwen2_vl","qwen3_5"}:
+            self.tokenizer = AutoTokenizer.from_pretrained(
+                checkpoint_path,
+                trust_remote_code=True,
+            )
+            # Older Qwen2-VL checkpoints may have been saved before special tokens were
+            # registered; re-add idempotently. add_special_tokens returns 0 if everything is
+            # already present. For Qwen3.5 we expect the saved tokenizer to be complete.
+            if self.LLM_backbone == "qwen2_vl":
+                import json
+                with open(QWEN_SPECIAL_TOKENS, "r") as file:
+                    special_token = json.load(file)
+                n_added = self.tokenizer.add_special_tokens({"additional_special_tokens": special_token})
+                if n_added:
+                    print(f"[yellow]agent_wrapper: re-added {n_added} special tokens missing from checkpoint")
+
+        # Action tokenizer now resolves token IDs against the real tokenizer instead of
+        # using hard-coded ID tables; this catches vocab drift loudly at startup.
+        if self.tokenizer is None:
+            raise RuntimeError(
+                f"backbone {self.LLM_backbone!r} requires a tokenizer to build the action map"
+            )
+        self.action_tokenizer = action_mapping.OneActionTokenizer.from_tokenizer(
+            backbone=self.LLM_backbone, tokenizer=self.tokenizer,
+        )
+
         self.prompt_library = load_json_file(Path(__file__).parent/"assets"/"instructions.json") #存储我写好的instructions
         self.recipe_fold=Path(__file__).parent/"assets"/"recipes" # 存储所有recipes的文件夹
         self.recipes = dict()  #制作方案集合
@@ -46,9 +80,9 @@ class VLLM_AGENT:
             True: "crafting table",
             False: "inventory",
         }
-        
+
         self.processor_wrapper = processor_wrapper.ProcessorWrapper(None,model_name=self.VLM_backbone)
-       
+
         self.actions = []
         self.action_chunk_len=action_chunk_len  # 一次返回一个action chunk
         # 用于带有记忆的agent
@@ -62,22 +96,9 @@ class VLLM_AGENT:
         )
         models = self.client.models.list()
         self.model = models.data[0].id
-        
+
         self.temperature = temperature
         self.instruction_type = instruction_type
-        
-        self.tokenizer = None
-        from transformers import AutoTokenizer
-        if self.LLM_backbone in {"llama-3","llama-2","qwen2_vl"}:
-            self.tokenizer = AutoTokenizer.from_pretrained(
-                checkpoint_path,  
-                trust_remote_code=True,
-            )
-            if self.LLM_backbone=="qwen2_vl" and len(self.tokenizer)==151657:
-                import json
-                with open("ultron/model/assets/special_token.json", "r") as file:
-                    special_token = json.load(file)
-                self.tokenizer.add_special_tokens({"additional_special_tokens":special_token})
     
     def reset(self):
         self.history = []
@@ -256,26 +277,69 @@ class VLLM_AGENT:
             print(prompts)
             open_logprobs = True
         
+        # Cap per-request token budget at chunk_len × per-action budget. Old code used
+        # max_tokens=1024 — if the model hallucinated long output it would burn through
+        # the entire budget before we got an action, ruining p99 latency.
+        max_tokens = self.action_chunk_len * self._PER_ACTION_TOKEN_BUDGET
         chat_completion = self.client.chat.completions.create(
             messages=messages,
             model=self.model,
             temperature=self.temperature,
-            max_tokens=1024,
-            top_p = 0.99,
-            logprobs = open_logprobs,
-            extra_body = {"skip_special_tokens":False, "top_k" : -1}
+            max_tokens=max_tokens,
+            top_p=0.99,
+            logprobs=open_logprobs,
+            extra_body={"skip_special_tokens": False, "top_k": -1},
         )
 
         outputs = chat_completion.choices[0].message.content
         if self.history_num:
             new_history[-1] = (image,outputs,thought,self.history[-1][-1]+1)
             self.history = new_history
-        if self.LLM_backbone in {"qwen2_vl"}:
-            outputs = self.tokenizer(outputs)["input_ids"]
+        # Re-tokenize the string output to IDs whenever we have a tokenizer. add_special_tokens=False
+        # avoids accidental BOS insertion that would offset the action-segment indices. The fragility
+        # the reviewers flagged for string-roundtrip is mostly about non-special tokens — action tokens
+        # are registered as atomic specials so they round-trip reliably.
+        if self.tokenizer is not None:
+            outputs = self.tokenizer(outputs, add_special_tokens=False)["input_ids"]
 
-        actions =  self.action_tokenizer.decode(outputs)
+        actions = self.action_tokenizer.decode(outputs)
 
-        len_action = min(self.action_chunk_len,len(actions))
+        # Sanity log: count tokens inside act_start/act_end segments that didn't map to a known
+        # action. Loud >5% rate is a sign of tokenizer drift or output garbage.
+        if isinstance(outputs, list):
+            self._log_decode_health(outputs, len(actions))
+
+        len_action = min(self.action_chunk_len, len(actions))
+        if len_action < self.action_chunk_len:
+            # Fewer actions than the chunk size — early EOS or model misbehavior. Log so we
+            # can spot it instead of silently under-acting.
+            print(f"[yellow]agent_wrapper: emitted {len(actions)} actions, expected {self.action_chunk_len}")
         self.actions = actions[:len_action]
-        
+
         return self.actions.pop(0)
+
+    def _log_decode_health(self, token_ids: list[int], n_decoded_actions: int) -> None:
+        """Best-effort: count action-segment tokens that aren't in the action map.
+
+        Useful as an early warning when the SFT'd model starts emitting garbage tokens
+        between <|act_start|> and <|act_end|>.
+        """
+        in_segment = False
+        unknown = total = 0
+        token_to_action = self.action_tokenizer.maps.token_to_action
+        beg = self.action_tokenizer.act_beg_id
+        end = self.action_tokenizer.act_end_id
+        for tid in token_ids:
+            if tid == beg:
+                in_segment = True
+                continue
+            if tid == end:
+                in_segment = False
+                continue
+            if in_segment:
+                total += 1
+                if tid not in token_to_action:
+                    unknown += 1
+        if total > 0 and unknown / total > 0.05:
+            print(f"[yellow]agent_wrapper: {unknown}/{total} action-segment tokens unrecognized "
+                  f"({100*unknown/total:.1f}%) across {n_decoded_actions} actions")

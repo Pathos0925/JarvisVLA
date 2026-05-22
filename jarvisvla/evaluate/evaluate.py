@@ -25,7 +25,7 @@ from jarvisvla.utils import file_utils
 from jarvisvla.evaluate import agent_wrapper
 
 
-def evaluate(video_path,checkpoints,environment_config:dict,model_config:dict,device="cuda:0",base_url=None):
+def evaluate(video_path,checkpoints,environment_config:dict,model_config:dict,device="cuda:0",base_url=None,seed_override=None):
 
     hydra.core.global_hydra.GlobalHydra.instance().clear() # 清理 Hydra 的全局实例
     config_path = Path(f"{environment_config['env_config']}.yaml")
@@ -35,14 +35,14 @@ def evaluate(video_path,checkpoints,environment_config:dict,model_config:dict,de
     cfg = hydra.compose(config_name=config_name)
     # camera_config
     camera_cfg = CameraConfig(**cfg.camera_config)
-    record_callback = RecordCallback(record_path=Path(video_path).parent, fps=30,show_actions=False)  
+    record_callback = RecordCallback(record_path=Path(video_path).parent, fps=30,show_actions=False)
     callbacks = [
         FastResetCallback(
             biomes=cfg.candidate_preferred_spawn_biome,
             random_tp_range=cfg.random_tp_range,
             start_time=cfg.start_time,
-        ), 
-        SpeedTestCallback(50), 
+        ),
+        SpeedTestCallback(50),
         TaskCallback(getattr(cfg,"task_conf",None)),
         RewardsCallback(getattr(cfg,"reward_conf",None)),
         InitInventoryCallback(cfg.init_inventory,
@@ -56,11 +56,16 @@ def evaluate(video_path,checkpoints,environment_config:dict,model_config:dict,de
     #    callbacks.append(TeleportCallback(x=cfg.teleport.x, y=cfg.teleport.y, z=cfg.teleport.z,))
     if cfg.mobs:
         callbacks.append(SummonMobsCallback(cfg.mobs))
-    
+
+    # Multi-seed eval: caller may pass seed_override to vary the env seed across parallel
+    # workers. Without it, all workers use cfg.seed (deterministic but degenerate for
+    # variance estimation).
+    seed = seed_override if seed_override is not None else cfg.seed
+
     # init env
     env =  MinecraftSim(
         action_type="env",
-        seed=cfg.seed,
+        seed=seed,
         obs_size=cfg.origin_resolution,
         render_size=cfg.resize_resolution,
         camera_config=camera_cfg,
@@ -135,9 +140,9 @@ def evaluate(video_path,checkpoints,environment_config:dict,model_config:dict,de
     return success
 
 @ray.remote
-def evaluate_wrapper(video_path,checkpoints,environment_config,base_url,model_config):
+def evaluate_wrapper(video_path,checkpoints,environment_config,base_url,model_config,seed_override=None):
 
-    success = evaluate(video_path=video_path,checkpoints=checkpoints,environment_config=environment_config,base_url=base_url,model_config=model_config)
+    success = evaluate(video_path=video_path,checkpoints=checkpoints,environment_config=environment_config,base_url=base_url,model_config=model_config,seed_override=seed_override)
     member_id = video_path.split("/")[-1].split(".")[0]
     return success[0],success[1],member_id
 
@@ -178,10 +183,23 @@ def multi_evaluate(args):
     if not undone_ids:
         return
     
+    seed_base = getattr(args, "seed_base", 0)
     roll = len(undone_ids) // args.split_number + (1 if len(undone_ids) % args.split_number != 0 else 0)
     for i in range(roll):
         part_undone_ids = undone_ids[i*args.split_number:min((i+1)*args.split_number, len(undone_ids))]
-        result_ids = [evaluate_wrapper.remote(video_path=os.path.join(video_fold,str(i),f"{i}.mp4"),checkpoints=args.checkpoints,environment_config=environment_config,base_url=args.base_url,model_config=model_config) for i in part_undone_ids]
+        # Per-worker seed = seed_base + worker_id, so --workers N produces N independent
+        # seeds for variance estimation rather than N identical replays of one seed.
+        result_ids = [
+            evaluate_wrapper.remote(
+                video_path=os.path.join(video_fold,str(i),f"{i}.mp4"),
+                checkpoints=args.checkpoints,
+                environment_config=environment_config,
+                base_url=args.base_url,
+                model_config=model_config,
+                seed_override=seed_base + i,
+            )
+            for i in part_undone_ids
+        ]
         futures = result_ids
         
         while len(futures) > 0:
@@ -214,6 +232,11 @@ if __name__ == "__main__":
     parser.add_argument('--temperature','-t',type=float,default=0.7)
     parser.add_argument('--history-num',type=int,default=0)
     parser.add_argument('--action-chunk-len',type=int,default=1)
+    # Multi-seed determinism: each ray worker uses seed_base + worker_id so that
+    # --workers N gives N independent episodes for variance estimation. Use --seed-base
+    # to shift the whole batch (e.g. for non-overlapping reruns).
+    parser.add_argument('--seed-base',type=int,default=0,
+                        help='Per-worker env seed = seed_base + worker_id.')
 
     args = parser.parse_args()
 

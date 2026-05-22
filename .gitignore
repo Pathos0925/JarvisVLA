@@ -46,3 +46,9 @@ tmp
 checkpoints
 
 *.pyc
+
+# Secrets and local-only state
+.env
+
+# Review outputs from scripts/review.py (may be large; not part of the project)
+runs/

@@ -27,6 +27,15 @@ from copy import deepcopy
 
 from jarvisvla.train.utils_train import IGNORE_TOKEN_ID
 
+
+def _tokenize_no_specials(tokenizer, text: str) -> np.ndarray:
+    """Tokenize a literal string without the tokenizer's automatic BOS/EOS additions.
+    Used to derive the user/assistant chat-template prefix IDs at runtime instead of
+    hard-coding (which is wrong the moment vocab differs across model versions)."""
+    ids = tokenizer(text, add_special_tokens=False)["input_ids"]
+    return np.array(ids, dtype=np.int64)
+
+
 def make_collator(collator_type: str, **kwargs) -> Callable:
     """
     This function creates a data collator based on the specified collator type.
@@ -54,27 +63,39 @@ def make_collator(collator_type: str, **kwargs) -> Callable:
 # MultimodalChatDataCollatorforVLM: Create a data collator to encode text and image pairs
 ################
 class MultimodalChatDataCollatorforVLM:
-    def __init__(self, processor:AutoProcessor, model_path:Union[pathlib.Path,str],  
-                 max_seq_length:int = 1024, 
+    # Backbones that share Qwen2-VL's smart-resize / image-processor knobs and the
+    # `<|im_start|>user|assistant` chat template prefix structure. Qwen3.5+ is in this
+    # set per the model card; if Qwen3.5's image processor diverges we'll branch separately.
+    _QWEN_IM_BACKBONES = {"qwen2_vl", "qwen3_5"}
+
+    def __init__(self, processor:AutoProcessor, model_path:Union[pathlib.Path,str]=None,
+                 backbone:str=None,
+                 max_seq_length:int = 1024,
                  with_grounding:bool = True,
                  with_image:bool = True, resize_image:bool = True, image_folder:Union[pathlib.Path,str]=None,
                  random_image_size:Tuple[int]=(224,224),default_image_size:Tuple[int]=None,
                  image_factor:int=None, min_pixels:int=None,  max_pixels:int=None, max_ratio:int=None,
                  check:bool=False, get_length=False ):
-        self.model_type = None
         self.processor = processor
-        
+
         # tokenizer
         self.max_seq_length = max_seq_length
-        self.user_template_token = None
-        self.assistant_template_token = None
-        self.user_template_token_len = None
-        self.assistant_template_token_len = None
         self.tokenize_redundant = 0
-        model_path = model_path.lower().replace('-','_')
-        self.model_path = model_path
-        
-        
+        # Back-compat: callers may still pass model_path; resolve to a backbone name.
+        if backbone is None:
+            if model_path is None:
+                raise ValueError("must pass backbone= (preferred) or model_path=")
+            normalized = str(model_path).lower().replace("-", "_").replace(".", "_")
+            for known in self._QWEN_IM_BACKBONES:
+                if known in normalized:
+                    backbone = known
+                    break
+            if backbone is None:
+                raise ValueError(f"could not infer backbone from model_path={model_path!r}; pass backbone= explicitly")
+        self.backbone = backbone
+        self.model_type = backbone  # back-compat alias used elsewhere in this file
+        self.model_path = backbone
+
         # image
         self.image_folder = image_folder
         self.with_image = with_image
@@ -92,14 +113,11 @@ class MultimodalChatDataCollatorforVLM:
             DataAugment.CONTRAST,
             DataAugment.TRANSLATE
         ]
-        
+
         # point
         self.with_grounding = with_grounding
-        
-        if "qwen2_vl" in model_path:
-            self.model_type = "qwen2_vl"
-            self.user_template_token = np.array([151644, 872],dtype=np.int64)#"<|im_start|>user\n"
-            self.assistant_template_token = np.array([151644, 77091],dtype=np.int64)#"<|im_start|>assistant\n"
+
+        if backbone in self._QWEN_IM_BACKBONES:
             self.tokenize_redundant = 0
             self.image_factor = 28
             self.min_pixels = processor.image_processor.min_pixels if min_pixels is None else min_pixels
@@ -107,9 +125,21 @@ class MultimodalChatDataCollatorforVLM:
             self.max_ratio = 200
             self.resize_image = True
         else:
-            ValueError(f"{model_path} is not support")
-            
-        self.user_template_token_len, self.assistant_template_token_len = len(self.user_template_token), len(self.assistant_template_token)
+            raise ValueError(f"backbone {backbone!r} not supported by MultimodalChatDataCollatorforVLM")
+
+        # Derive user/assistant template prefix IDs from the live tokenizer instead of
+        # hard-coding (which was wrong the moment vocab changed across Qwen versions).
+        # Caught by all three frontier reviewers as the silent-loss-masking bug.
+        self.user_template_token = _tokenize_no_specials(processor.tokenizer, "<|im_start|>user")
+        self.assistant_template_token = _tokenize_no_specials(processor.tokenizer, "<|im_start|>assistant")
+        self.user_template_token_len = len(self.user_template_token)
+        self.assistant_template_token_len = len(self.assistant_template_token)
+        if self.user_template_token_len == 0 or self.assistant_template_token_len == 0:
+            raise RuntimeError(
+                f"backbone {backbone!r}: tokenizer produced empty user/assistant template prefix. "
+                f"Chat template likely doesn't use the `<|im_start|>role` convention; "
+                f"update the prefix strings for this backbone."
+            )
             
         self.check = check
         self.get_length = get_length
@@ -203,8 +233,6 @@ class MultimodalChatDataCollatorforVLM:
             if self.with_image:
                 images.extend(local_images)
    
-            if "qwen2_vl" not in self.model_type:
-                conversations = apply_private_conversations(conversations, self.model_type)
             text = self.processor.tokenizer.apply_chat_template(conversations,tokenize=False, add_generation_prompt=False)
             texts.append(text)
             
@@ -253,7 +281,17 @@ class MultimodalChatDataCollatorforVLM:
             len_beg_matches = len(beg_matches)
             len_end_matches = len(end_matches)
             if not len_beg_matches:
-                self.my_console.log(f"[red]Warning! len_beg_matches is {len_beg_matches}")
+                # Zero user-template matches means the assistant-loss mask leaks across
+                # user prompts and image regions — training silently learns to predict them.
+                # All three frontier reviewers flagged the previous `continue` as a critical bug.
+                msg = (
+                    f"user template prefix not found in batched input_ids. "
+                    f"backbone={self.backbone}, user_template_token={self.user_template_token.tolist()}, "
+                    f"first 32 ids in label: {np_label[:32].tolist()}"
+                )
+                if self.check:
+                    raise RuntimeError(msg)
+                self.my_console.log(f"[red]CRITICAL: {msg}")
                 continue
             # if out of max token length
             if len_beg_matches==len_end_matches+1:
@@ -284,8 +322,8 @@ class MultimodalChatDataCollatorforVLM:
         return batch
 
 class VLAMultimodalChatDataCollatorforVLM(MultimodalChatDataCollatorforVLM):
-    def __init__(self, processor, model_path, **kwargs):
-        super().__init__(processor=processor, model_path=model_path, **kwargs)
+    def __init__(self, processor, model_path=None, backbone=None, **kwargs):
+        super().__init__(processor=processor, model_path=model_path, backbone=backbone, **kwargs)
         self.aug_methods = [
             DataAugment.HUE,
             DataAugment.SATURATION,
@@ -293,22 +331,6 @@ class VLAMultimodalChatDataCollatorforVLM(MultimodalChatDataCollatorforVLM):
             DataAugment.CONTRAST,
             DataAugment.TRANSLATE,
         ]
-
-def apply_private_conversations(conversations:list, tokenizer=None):
-    """Prepare the text from a sample of the dataset."""
-    # LLAVA_next: batches处理的时候，输入的是所有images，然后根据<image>来分配
-    conversations = []
-    for conv in conversations:
-        content = ""
-        for item in conv["content"]:
-            if item["type"] == "text":
-                content += item["text"]
-            elif item["type"] == "image":
-                content += "<image>"
-                image_count+=1
-        conversations.append({"role": conv["role"], "content": content})
-            
-    return conversations
 
 def image_hue_augmentation(image: Image.Image, hue_factor:float =  None,random_hue: float = 0.05) -> Image.Image:
     """Randomly adjust the hue of the image within a specified range."""
