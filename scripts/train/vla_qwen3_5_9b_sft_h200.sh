@@ -7,11 +7,12 @@
 # then drop to 2 + GRAD_ACCUM=2 to preserve effective batch size.
 #
 # Hyperparams are identical to the production DeepSpeed script (vla_qwen3_5_9b_sft.sh)
-# with three throughput tweaks safe on 144 GB H200:
-#   - no --gradient_checkpointing (trades activation memory for ~30% step speedup)
-#   - --dataloader_num_workers 6 (image decode is CPU-bound at 2)
-#   - Liger-Kernel applied automatically when backbone=qwen3_5 (fused linear+CE saves
-#     activation memory at 248K vocab; disable with LIGER=0)
+# with one change: Liger-Kernel auto-applies for backbone=qwen3_5 (fused RMSNorm /
+# SwiGLU / linear+CE). Disable with LIGER=0 if any kernel mismatches; harmless when
+# enabled. A/B run 2026-05-22 showed Liger + no-GC + 6 dataloader workers was a wash
+# (-2.3% throughput from setup overhead), so this script keeps the conservative
+# memory profile: gradient_checkpointing on, 2 dataloader workers. Override below
+# via env vars if pushing throughput.
 # If OOM hits at BATCH=4, drop BATCH=2 + GRAD_ACCUM=2.
 #
 # R2 (Cloudflare) checkpoint upload is opt-in via env vars; absent → disabled silently.
@@ -33,6 +34,13 @@ batch="${BATCH:-4}"
 gradient_accumulation_steps="${GRAD_ACCUM:-1}"
 cuda_visible_devices="${CUDA_VISIBLE_DEVICES:-0,1}"
 training_port="${TRAINING_PORT:-24001}"
+
+# Conservative defaults; override via env for long runs:
+#   GRADIENT_CHECKPOINTING=1 → enable (default ON via :+)
+#   DATALOADER_NUM_WORKERS, SAVE_STEPS, SAVE_TOTAL_LIMIT, SAVE_ONLY_MODEL
+# To DISABLE grad-checkpointing for a memory-rich run, set GRADIENT_CHECKPOINTING=
+# (empty string), e.g. `GRADIENT_CHECKPOINTING= ...` on the command line.
+export GRADIENT_CHECKPOINTING="${GRADIENT_CHECKPOINTING-1}"
 
 dataset_p="${DATASET_P:-1.0}"
 max_steps_arg=""
@@ -59,7 +67,7 @@ torchrun --nproc-per-node="$nproc" --master-port="$training_port" \
     --attn_implementation flash_attention_2 \
     --dataset_name "$dataset_name" \
     --dataset_p "$dataset_p" \
-    --dataloader_num_workers 6 \
+    --dataloader_num_workers ${DATALOADER_NUM_WORKERS:-2} \
     --dataloader_pin_memory True \
     --seed 43 \
     --model_name_or_path "$base_model_path" \
@@ -79,13 +87,15 @@ torchrun --nproc-per-node="$nproc" --master-port="$training_port" \
     $max_steps_arg \
     --eval_strategy "no" \
     --save_strategy "steps" \
-    --save_steps 1000 \
-    --save_total_limit 3 \
+    --save_steps ${SAVE_STEPS:-1000} \
+    --save_total_limit ${SAVE_TOTAL_LIMIT:-3} \
+    ${SAVE_ONLY_MODEL:+--save_only_model True} \
     --output_dir "$output_dir" \
     --run_name "$WANDB_NAME" \
     --logging_strategy "steps" \
     --logging_steps 10 \
     --num_train_epochs $epoch \
+    ${GRADIENT_CHECKPOINTING:+--gradient_checkpointing} \
     --torch_dtype bfloat16 \
     --bf16 True \
     --remove_unused_columns False \
