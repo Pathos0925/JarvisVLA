@@ -4,7 +4,8 @@ Wired into train.py via R2UploadCallback.maybe_create(...). Enabled by setting
 required env vars; absent → callback returns None and training proceeds unchanged.
 
 Required env vars:
-    R2_BUCKET, R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY
+    R2_BUCKET, R2_ACCOUNT_ID, R2_SECRET_ACCESS_KEY,
+    R2_ACCESS_KEY_ID or R2_ACCESS_KEY  (either accepted)
 
 Optional:
     R2_PREFIX           — remote key prefix (default: basename of output_dir)
@@ -29,7 +30,12 @@ from pathlib import Path
 
 from transformers import TrainerCallback
 
-_REQUIRED_ENV = ["R2_BUCKET", "R2_ACCOUNT_ID", "R2_ACCESS_KEY_ID", "R2_SECRET_ACCESS_KEY"]
+_REQUIRED_ENV = ["R2_BUCKET", "R2_ACCOUNT_ID", "R2_SECRET_ACCESS_KEY"]
+
+
+def _access_key_id() -> str | None:
+    """Accept either R2_ACCESS_KEY_ID (AWS-style) or R2_ACCESS_KEY (short form)."""
+    return os.environ.get("R2_ACCESS_KEY_ID") or os.environ.get("R2_ACCESS_KEY")
 
 
 class R2UploadCallback(TrainerCallback):
@@ -39,6 +45,8 @@ class R2UploadCallback(TrainerCallback):
     def maybe_create(cls, output_dir: str) -> "R2UploadCallback | None":
         """Construct only if env + boto3 are ready; otherwise print why and return None."""
         missing = [v for v in _REQUIRED_ENV if not os.environ.get(v)]
+        if not _access_key_id():
+            missing.append("R2_ACCESS_KEY_ID (or R2_ACCESS_KEY)")
         if missing:
             print(f"[r2-upload] disabled — missing env vars: {missing}", flush=True)
             return None
@@ -59,7 +67,7 @@ class R2UploadCallback(TrainerCallback):
         self._s3 = boto3.client(
             "s3",
             endpoint_url=endpoint,
-            aws_access_key_id=os.environ["R2_ACCESS_KEY_ID"],
+            aws_access_key_id=_access_key_id(),
             aws_secret_access_key=os.environ["R2_SECRET_ACCESS_KEY"],
             region_name="auto",
         )
