@@ -1,3 +1,4 @@
+import os
 import time
 
 from rich import print
@@ -69,8 +70,18 @@ class VLLM_AGENT:
             raise RuntimeError(
                 f"backbone {self.LLM_backbone!r} requires a tokenizer to build the action map"
             )
+        # ACTION_SCHEMA env override: training data is Qwen2-VL-encoded
+        # (<|reserved_special_token_178|>...<|reserved_special_token_179|>),
+        # so models trained with --backbone=qwen3_5 still emit qwen2_vl action
+        # tokens. Set ACTION_SCHEMA=qwen2_vl to parse with that schema instead
+        # of the LLM backbone. See README "Debugging history" section.
+        action_schema_override = os.environ.get("ACTION_SCHEMA")
+        schema_backbone = action_schema_override or self.LLM_backbone
+        if action_schema_override and action_schema_override != self.LLM_backbone:
+            print(f"[agent_wrapper] action_schema override: parsing with {action_schema_override!r} "
+                  f"(model backbone is {self.LLM_backbone!r})", flush=True)
         self.action_tokenizer = action_mapping.OneActionTokenizer.from_tokenizer(
-            backbone=self.LLM_backbone, tokenizer=self.tokenizer,
+            backbone=schema_backbone, tokenizer=self.tokenizer,
         )
 
         self.prompt_library = load_json_file(Path(__file__).parent/"assets"/"instructions.json") #存储我写好的instructions
