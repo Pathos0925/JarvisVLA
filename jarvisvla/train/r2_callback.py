@@ -157,21 +157,55 @@ class R2UploadCallback(TrainerCallback):
         t0 = time.time()
         uploaded_bytes = 0
         skipped = 0
+        failed = []
         for f in files:
             key = f"{remote_prefix}/{f.relative_to(local_dir).as_posix()}"
             size = f.stat().st_size
             if self._already_uploaded(key, size):
                 skipped += 1
                 continue
-            self._s3.upload_file(str(f), self.bucket, key)
-            uploaded_bytes += size
+            if self._upload_file_with_retry(f, key):
+                uploaded_bytes += size
+            else:
+                failed.append(key)
         dt = time.time() - t0
         rate = uploaded_bytes / dt / 2**30 if dt > 0 else 0
         print(
             f"[r2-upload] done   {local_dir.name}  in {dt:.1f}s  "
-            f"({uploaded_bytes/2**30:.2f} GiB uploaded, {skipped} files skipped, {rate:.2f} GiB/s)",
+            f"({uploaded_bytes/2**30:.2f} GiB uploaded, {skipped} files skipped, "
+            f"{len(failed)} failed, {rate:.2f} GiB/s)",
             flush=True,
         )
+        if failed:
+            # Re-raise so wait_all() surfaces the failure loudly rather than silently
+            # losing the checkpoint. Gemini's review-2 concern: silent drops break
+            # R2-as-source-of-truth if a transient network blip kills uploads.
+            raise RuntimeError(
+                f"[r2-upload] {len(failed)} file(s) failed to upload after retries: "
+                f"{failed[:3]}{'...' if len(failed) > 3 else ''}"
+            )
+
+    def _upload_file_with_retry(self, local_path: Path, key: str, max_attempts: int = 4) -> bool:
+        """Upload one file with exponential backoff. Returns True on success."""
+        delay = 2.0
+        for attempt in range(1, max_attempts + 1):
+            try:
+                self._s3.upload_file(str(local_path), self.bucket, key)
+                return True
+            except Exception as e:
+                if attempt == max_attempts:
+                    print(
+                        f"[r2-upload] FAIL after {max_attempts} attempts: {key}  ({type(e).__name__}: {e!r})",
+                        flush=True,
+                    )
+                    return False
+                print(
+                    f"[r2-upload] retry {attempt}/{max_attempts} for {key} in {delay:.0f}s "
+                    f"({type(e).__name__}: {e!r})",
+                    flush=True,
+                )
+                time.sleep(delay)
+                delay *= 2
 
     def _already_uploaded(self, key: str, size: int) -> bool:
         try:

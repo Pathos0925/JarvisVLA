@@ -35,12 +35,11 @@ gradient_accumulation_steps="${GRAD_ACCUM:-1}"
 cuda_visible_devices="${CUDA_VISIBLE_DEVICES:-0,1}"
 training_port="${TRAINING_PORT:-24001}"
 
-# Conservative defaults; override via env for long runs:
-#   GRADIENT_CHECKPOINTING=1 → enable (default ON via :+)
-#   DATALOADER_NUM_WORKERS, SAVE_STEPS, SAVE_TOTAL_LIMIT, SAVE_ONLY_MODEL
-# To DISABLE grad-checkpointing for a memory-rich run, set GRADIENT_CHECKPOINTING=
-# (empty string), e.g. `GRADIENT_CHECKPOINTING= ...` on the command line.
-export GRADIENT_CHECKPOINTING="${GRADIENT_CHECKPOINTING-1}"
+# Toggle flags via boolean env vars (1=on, 0=off; default values below).
+# Set to anything truthy in {1, true, True, on, yes, y} to enable.
+_truthy() { case "${1,,}" in 1|true|on|yes|y) return 0;; *) return 1;; esac; }
+GC_FLAG=""; _truthy "${GRADIENT_CHECKPOINTING:-1}" && GC_FLAG="--gradient_checkpointing"
+SAVE_ONLY_FLAG=""; _truthy "${SAVE_ONLY_MODEL:-0}" && SAVE_ONLY_FLAG="--save_only_model True"
 
 dataset_p="${DATASET_P:-1.0}"
 max_steps_arg=""
@@ -88,13 +87,13 @@ torchrun --nproc-per-node="$nproc" --master-port="$training_port" \
     --save_strategy "steps" \
     --save_steps ${SAVE_STEPS:-1000} \
     --save_total_limit ${SAVE_TOTAL_LIMIT:-3} \
-    ${SAVE_ONLY_MODEL:+--save_only_model True} \
+    $SAVE_ONLY_FLAG \
     --output_dir "$output_dir" \
     --run_name "$WANDB_NAME" \
     --logging_strategy "steps" \
     --logging_steps 10 \
     --num_train_epochs $epoch \
-    ${GRADIENT_CHECKPOINTING:+--gradient_checkpointing} \
+    $GC_FLAG \
     --torch_dtype bfloat16 \
     --bf16 True \
     --remove_unused_columns False \
