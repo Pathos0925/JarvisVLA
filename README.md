@@ -267,6 +267,58 @@ After SFT lands and vLLM is up, the order of operations is:
 3. **If gate passes** → start Phase 2 (Gemma planner).
 4. **If gate doesn't pass** → bisect via the recipe knobs in REIMPLEMENTATION_PLAN.md §Step 8 (LR sweep, unfreeze vision encoder, vision-token budget 256 → 512).
 
+### Monitoring a live training run
+
+```bash
+# Is the SFT process still alive?
+pgrep -af "torchrun.*jarvisvla" | head -3
+
+# Latest training metrics (filters out tqdm progress noise)
+grep -E "'loss':|'grad_norm':|train_runtime" /tmp/sft_full.log | tail -10
+
+# How many R2 uploads have happened?
+grep -E "r2-upload" /tmp/sft_full.log | tail -20
+
+# Inspect the most recent saved checkpoint (need to copy preprocessor configs first)
+CKPT=$(ls -t /workspace/checkpoints/*/checkpoint-* -d | head -1)
+cp /workspace/models/Qwen3.5-9B/preprocessor_config.json /workspace/models/Qwen3.5-9B/video_preprocessor_config.json "$CKPT"/
+PYTHONPATH=. MODEL_PATH="$CKPT" python -m tests.inspect_checkpoint
+
+# GPU utilization (sanity: both H200s should be busy)
+nvidia-smi --query-gpu=index,memory.used,utilization.gpu --format=csv
+
+# Disk pressure (save_total_limit=3 keeps ~150 GB rotating)
+df -h /workspace; du -sh /workspace/checkpoints/*/
+```
+
+If you need to **kill** the run cleanly:
+```bash
+pkill -TERM -f "torchrun.*jarvisvla"  # SIGTERM first
+sleep 5
+pkill -KILL -f "jarvisvla/train"      # SIGKILL if still alive
+```
+
+To **resume from a checkpoint** (saved with `SAVE_ONLY_MODEL=0`, the default):
+Trainer auto-resumes if `OUTPUT_DIR` contains `checkpoint-*` subdirs. Re-run the same launch command and it picks up where it left off.
+
+### Rollout after SFT completes
+
+Use the separate `vllm` conda env (vllm 0.21 + cu13 packages live there, isolated from SFT):
+
+```bash
+conda activate vllm  # /home/user1/miniconda3/envs/vllm
+MODEL_PATH=/path/to/final/checkpoint bash scripts/inference/serve_vllm_qwen3_5.sh
+```
+
+For rollout via `jarvisvla.evaluate.evaluate`, **set `ACTION_SCHEMA=qwen2_vl`** (until the
+re-preprocessing or in-collator translation lands — see "Debugging history"):
+
+```bash
+ACTION_SCHEMA=qwen2_vl python -m jarvisvla.evaluate.evaluate \
+    --workers 0 --checkpoints /path/to/final/checkpoint \
+    --base-url http://localhost:9052/v1
+```
+
 ### Multi-LLM review
 
 `scripts/review.py` sends the plan + selected files to multiple frontier models via OpenRouter in parallel, saves their critiques under `runs/reviews/<timestamp>/`. Useful for getting a second opinion before committing to a long run. Requires `OPENROUTER_API_KEY` in `.env` or env.
