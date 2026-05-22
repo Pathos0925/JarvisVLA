@@ -39,7 +39,7 @@ The next generation of JARVIS-VLA targets:
 | H200 SFT script (no DeepSpeed, BATCH=4) | ✅ done (`scripts/train/vla_qwen3_5_9b_sft_h200.sh`) |
 | Phase-1 3000-step smoke + inspector | ✅ done; image preprocessing bug + LR-for-new-tokens fixed; fix1 + speedup1 smokes both PARSEABLE (loss 0.66, 4/4 chunks emitted) |
 | Async R2 checkpoint upload | ✅ done with retry (`jarvisvla/train/r2_callback.py`); auto-loads from `.env` |
-| Full Phase-1 SFT run | ⏳ **running** — launched 2026-05-22 evening, ~32 hr ETA, 115,763 steps, R2 uploads confirmed |
+| Full Phase-1 SFT run | ⏳ **running** — launched 2026-05-22 evening, ~32 hr ETA, 115,763 steps. checkpoint-5000 PARSEABLE (loss ~0.5), R2 upload verified (50.92 GiB in 549 s). |
 | vLLM serve + smoke rollout | ⏳ pending SFT (deferred install — see [Known gotchas](#known-gotchas)) |
 | Headline eval vs Qwen2-VL baseline | ⏳ pending SFT |
 | Async pipelining in `agent_wrapper` | ⏳ deferred |
