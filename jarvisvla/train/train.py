@@ -34,6 +34,35 @@ if TRL_USE_RICH:
 from datasets import load_dataset,Dataset
 
 import torch
+
+# --- Resume compatibility shim (added for cross-version checkpoint resume) -------------
+# transformers' Trainer._load_rng_state() calls torch.load(rng_file, weights_only=True).
+# torch >= 2.6's safe unpickler rejects numpy globals, and the original training box saved
+# the RNG state under numpy 2.x ("numpy._core.*") while this env pins numpy 1.26.4
+# ("numpy.core.*"). Both break the resume. These checkpoints are our own (pulled from our
+# R2 bucket) and therefore trusted, so we (a) alias numpy._core -> numpy.core for unpickling
+# and (b) force weights_only=False on torch.load. This makes resume robust across both the
+# current checkpoint and any future ones this run writes.
+import sys as _sys
+import numpy as _np
+if not hasattr(_np, "_core"):
+    try:
+        import numpy.core as _npcore
+        _sys.modules["numpy._core"] = _npcore
+        for _sub in ("multiarray", "umath", "numeric", "_multiarray_umath"):
+            try:
+                _sys.modules[f"numpy._core.{_sub}"] = __import__(f"numpy.core.{_sub}", fromlist=[_sub])
+            except Exception:
+                pass
+    except Exception:
+        pass
+_orig_torch_load = torch.load
+def _trusted_torch_load(*args, **kwargs):
+    kwargs["weights_only"] = False  # trusted local/R2 checkpoints; numpy in rng_state
+    return _orig_torch_load(*args, **kwargs)
+torch.load = _trusted_torch_load
+# --------------------------------------------------------------------------------------
+
 from tqdm.rich import tqdm
 from transformers import (
     AutoModelForImageTextToText,

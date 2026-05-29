@@ -8,13 +8,13 @@
 
 [**Project Website**](https://craftjarvis.github.io/JarvisVLA/) | [**Datasets**](https://huggingface.co/datasets/CraftJarvis/minecraft-vla-sft)
 
-This repo is in the middle of a Phase-1 reimplementation that moves the executor backbone from `Qwen2-VL-7B` to `Qwen3.5-9B` and adds chunked-action SFT. The design rationale and step-by-step plan live in [REIMPLEMENTATION_PLAN.md](REIMPLEMENTATION_PLAN.md). This README is the operational reference — what to run, what's been validated, and what's known to bite.
+This repo is in the middle of a Phase-1 reimplementation that moves the executor backbone from `Qwen2-VL-7B` to `Qwen3.5-9B` and adds chunked-action SFT. The design rationale and step-by-step plan live in [PLAN.md](PLAN.md). This README is the operational reference — what to run, what's been validated, and what's known to bite.
 
 ## Updates
 
 - **[2026.05.22 evening]** **Full Phase-1 SFT launched on 2× H200** (~32 hr at ~1 s/step on `DATASET_P=1.0`, `EMBED_LR=3e-5`, `LIGER=0`, `SAVE_STEPS=5000`). Pre-launch second-round review (Opus 4.7 / GPT-5.5 Pro / Gemini 3.1 Pro) caught and fixed: `--warmup_steps 100` overriding the ratio (dropped — warmup_ratio 0.03 now → 3480 warmup steps); EMBED_LR=30× over 116K steps risking catastrophic forgetting on pretrained vocab (lowered to 10×); R2 callback silently dropping failed uploads (now retries 4× with exponential backoff and surfaces failures); bash `${VAR:+...}` treating "0" as truthy (replaced with proper `_truthy` helper); `.env` not auto-loaded into training process (script now sources it). Also: `agent_wrapper.py` accepts `ACTION_SCHEMA` env to handle the Qwen2-VL action-token emission from a `--backbone=qwen3_5` checkpoint. Two prior smokes (`fix1`, `speedup1`) produced PARSEABLE checkpoints with final loss 0.66; speedup attempt (Liger+no-GC+workers=6) was net -2.3% so reverted; Liger machinery kept as opt-in. **R2 upload confirmed working** at training start.
 - **[2026.05.22 morning]** Phase-1 SFT smoke run validated on 2× H200 144 GB. End-to-end pipeline (preprocessor → SFT → inspector) green, plus a multi-LLM code review surfaced one critical bug (image double-rescale in the data collator) and one important tuning issue (LR too low for newly-added action token embeddings) — both fixed; retrain landed PARSEABLE checkpoint with clean Qwen2-VL action grammar (4/4 chunks per response). New: H200-simplified SFT script (no DeepSpeed), async R2 checkpoint upload, checkpoint inspector, `DifferentialLRTrainer` for per-matrix learning rates, vllm in a separate conda env.
-- **[2026.05.21]** Started reimplementation of the VLA backbone on **`Qwen/Qwen3.5-9B`** (multimodal). Planner for Phase 2 will be **`google/gemma-4-26B-A4B-it`**. See [REIMPLEMENTATION_PLAN.md](REIMPLEMENTATION_PLAN.md) for the full plan.
+- **[2026.05.21]** Started reimplementation of the VLA backbone on **`Qwen/Qwen3.5-9B`** (multimodal). Planner for Phase 2 will be **`google/gemma-4-26B-A4B-it`**. See [PLAN.md](PLAN.md) for the full plan.
 - **[2025.03.21]** Paper available on [arXiv](https://arxiv.org/pdf/2503.16365).
 
 ---
@@ -30,7 +30,7 @@ The next generation of JARVIS-VLA targets:
 
 | Stage | Status |
 | --- | --- |
-| Plan + design review | ✅ done ([REIMPLEMENTATION_PLAN.md](REIMPLEMENTATION_PLAN.md); frontier-LLM critique under `runs/reviews/`) |
+| Plan + design review | ✅ done ([PLAN.md](PLAN.md); frontier-LLM critique under `runs/reviews/`) |
 | Foundation refactor (action tokens, `--backbone`, helpers) | ✅ done, commits `65d0b2b` → `8c32ec5` |
 | Smoke test against real Qwen3.5-9B | ✅ done (`tests/smoke_qwen3_5.py`) |
 | Chunked-action SFT preprocessor | ✅ done; 935,440 chunks at 99.1% yield, 100% with exactly 4 action segments |
@@ -39,7 +39,7 @@ The next generation of JARVIS-VLA targets:
 | H200 SFT script (no DeepSpeed, BATCH=4) | ✅ done (`scripts/train/vla_qwen3_5_9b_sft_h200.sh`) |
 | Phase-1 3000-step smoke + inspector | ✅ done; image preprocessing bug + LR-for-new-tokens fixed; fix1 + speedup1 smokes both PARSEABLE (loss 0.66, 4/4 chunks emitted) |
 | Async R2 checkpoint upload | ✅ done with retry (`jarvisvla/train/r2_callback.py`); auto-loads from `.env` |
-| Full Phase-1 SFT run | ⏳ **running** — launched 2026-05-22 evening (PID 74111, `/tmp/sft_full.log`). At step **38K / 115,763 (33% in)**, ~10h elapsed, ~21h to go, 1.04 it/s sustained. 3 mid-train checkpoints inspected → all `PARSEABLE` (4/4 chunks). 7 R2 uploads complete (5K/10K/15K/20K/25K/30K/35K), each 50.92 GiB in ~9 min, 0 failures. Loss ≈ 0.48 holding steady around the cosine peak. Vision-grounding ablation on checkpoint-30000 with sampling: **9/16 samples emit camera motion**; one TNT-crafting prompt matched ground truth on all 4 chunks (memorized recipe). |
+| Full Phase-1 SFT run | ⏳ **running (resumed)** — the original 2026-05-22 launch reached ~step 38K then stopped; **now resumed from `checkpoint-35000 / 115,763` (~30%) on a second 2× H200 box** (live state in [PLAN.md §1](PLAN.md#1-current-status-2026-05-28)). Recipe `DATASET_P=1.0 EMBED_LR=3e-5 LIGER=0 SAVE_STEPS=5000`, loss ≈ 0.47. Original run produced: 3 mid-train checkpoints `PARSEABLE` (4/4 chunks); R2 uploads 5K–35K (50.92 GiB each, 0 failures); checkpoint-30000 vision-grounding ablation **9/16 samples emit camera motion**, one TNT-crafting prompt matched ground truth on all 4 chunks. |
 | vLLM serve + smoke rollout | ⏳ pending SFT (deferred install — see [Known gotchas](#known-gotchas)) |
 | Headline eval vs Qwen2-VL baseline | ⏳ pending SFT |
 | Async pipelining in `agent_wrapper` | ⏳ deferred |
@@ -283,9 +283,9 @@ Loads the checkpoint and generates actions for 3 valid-split samples using `tran
 After SFT lands and vLLM is up, the order of operations is:
 
 1. **Single-episode rollout** — `python -m jarvisvla.evaluate.evaluate --workers 0 --checkpoints /path/to/checkpoint --base-url http://localhost:9052/v1`. Look for action-decode warnings and smoothness.
-2. **Headline eval** — multi-seed (`--seed-base 0`, `--workers 5+`) on the existing config suite. Compare success rate + p50 step latency to the Qwen2-VL 7B baseline. Phase-1 gate is "matches or exceeds baseline" — see REIMPLEMENTATION_PLAN.md §Step 8.
+2. **Headline eval** — multi-seed (`--seed-base 0`, `--workers 5+`) on the existing config suite. Compare success rate + p50 step latency to the Qwen2-VL 7B baseline. Phase-1 gate is "matches or exceeds baseline" — see PLAN.md §4.3.
 3. **If gate passes** → start Phase 2 (Gemma planner).
-4. **If gate doesn't pass** → bisect via the recipe knobs in REIMPLEMENTATION_PLAN.md §Step 8 (LR sweep, unfreeze vision encoder, vision-token budget 256 → 512).
+4. **If gate doesn't pass** → bisect via the recipe knobs in PLAN.md §4.3 (LR sweep, unfreeze vision encoder, vision-token budget 256 → 512).
 
 ### Monitoring a live training run
 
@@ -486,9 +486,9 @@ Order of operations once a checkpoint exists and the inspector reports `PARSEABL
 
 1. **vLLM serve smoke test** — `bash scripts/inference/serve_vllm_qwen3_5.sh` with `MODEL_PATH=/path/to/checkpoint`. Confirm `qwen3_next_mtp` initializes. (Requires vLLM in a separate venv per [gotcha 12](#known-gotchas).)
 2. **Single-episode rollout** — `python -m jarvisvla.evaluate.evaluate --workers 0 --checkpoints /path/to/checkpoint --base-url http://localhost:9052/v1`. Look for action-decode warnings and step smoothness.
-3. **Headline eval** — multi-seed (`--seed-base 0`, `--workers 5+`) on the existing eval config suite; compare success rate + p50 step latency vs the Qwen2-VL 7B baseline. Phase-1 gate is "matches or exceeds baseline" — see REIMPLEMENTATION_PLAN.md §Step 8.
+3. **Headline eval** — multi-seed (`--seed-base 0`, `--workers 5+`) on the existing eval config suite; compare success rate + p50 step latency vs the Qwen2-VL 7B baseline. Phase-1 gate is "matches or exceeds baseline" — see PLAN.md §4.3.
 4. **If gate passes**: start Phase 2 (Gemma-4-26B-A4B planner + predicate-based sub-goal queue).
-5. **If gate doesn't pass**: bisect via the recipe knobs in REIMPLEMENTATION_PLAN.md §Step 8 (LR sweep, unfreeze vision encoder, vision-token budget 256 → 512).
+5. **If gate doesn't pass**: bisect via the recipe knobs in PLAN.md §4.3 (LR sweep, unfreeze vision encoder, vision-token budget 256 → 512).
 
 ---
 

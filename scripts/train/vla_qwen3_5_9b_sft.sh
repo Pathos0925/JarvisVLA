@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Qwen3.5-9B SFT for JarvisVLA — Phase 1 of REIMPLEMENTATION_PLAN.md.
+# Qwen3.5-9B SFT for JarvisVLA — Phase 1 of PLAN.md.
 #
 # Production config (validated by vla_qwen3_5_9b_sft_dryrun.sh, 2026-05-22):
 #   - DeepSpeed ZeRO-2 with CPU optimizer offload (s2_offload.json) — needed because
@@ -11,7 +11,7 @@
 #
 # Speedup: vLLM serves with --speculative-config qwen3_next_mtp at inference time.
 # No training-side MTP wiring required — Qwen3.5-9B does not expose separately
-# trainable MTP heads (see REIMPLEMENTATION_PLAN.md Step 7).
+# trainable MTP heads (see PLAN.md §4.1).
 set -euo pipefail
 
 export HF_HOME="${HF_HOME:-/ephemeral/.hf_cache}"

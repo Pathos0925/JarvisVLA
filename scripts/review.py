@@ -41,9 +41,9 @@ OPENROUTER_API = "https://openrouter.ai/api/v1"
 
 # Best-guess defaults — verify with `--list-models` if you get a 404.
 DEFAULT_MODELS = [
-    "anthropic/claude-opus-4.7",
+    "anthropic/claude-opus-4.8",
     "openai/gpt-5.5-pro",
-    "google/gemini-3.1-pro-preview",
+    "google/gemini-3.5-flash",
 ]
 
 DEFAULT_SYSTEM = """You are a senior ML engineer reviewing an in-progress research project.

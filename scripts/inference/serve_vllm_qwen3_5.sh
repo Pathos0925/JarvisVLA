@@ -2,7 +2,7 @@
 # vLLM serve for the Qwen3.5-9B JarvisVLA executor.
 #
 # Speedup: native MTP via Qwen3.5-9B's qwen3_next_mtp speculative-decoding mode (no
-# training-side wiring required — see REIMPLEMENTATION_PLAN.md Step 7).
+# training-side wiring required — see PLAN.md §4.1).
 #
 # Override paths via env vars:
 #   MODEL_PATH=...   path to SFT'd checkpoint  (default: Qwen/Qwen3.5-9B base)
